@@ -2,8 +2,9 @@ from fastapi import FastAPI, WebSocket, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import re
+import json
 import logging
-import openai
+import anthropic
 
 # Basic logger
 logger = logging.getLogger("hr-agent")
@@ -14,16 +15,16 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 # Read env
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4")
-REDACT_PII = os.getenv("REDACT_PII", "true").lower() in ("1","true","yes")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
+REDACT_PII = os.getenv("REDACT_PII", "true").lower() in ("1", "true", "yes")
 
-if not OPENAI_API_KEY:
-    logger.warning("OPENAI_API_KEY is not set. OpenAI calls will fail until it is configured.")
-else:
-    openai.api_key = OPENAI_API_KEY
+if not ANTHROPIC_API_KEY:
+    logger.warning("ANTHROPIC_API_KEY is not set. Claude calls will fail until it is configured.")
 
-app = FastAPI(title="HR Agent Prototype - OpenAI")
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+
+app = FastAPI(title="HR Agent - Claude")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,18 +33,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+SYSTEM_PROMPT = (
+    "Vous etes un assistant RH expert. Repondez de maniere concise, professionnelle et conforme au RGPD. "
+    "Si la requete contient des informations personnelles identifiables, appliquez les regles de minimisation des donnees."
+)
+
 # Simple PII redaction for prototype
 _email_re = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
 _phone_re = re.compile(r"(\+?\d[\d \-()]{7,}\d)")
 
+
 def redact_pii(text: str) -> str:
     if not text:
         return text
-    # redact emails
     redacted = _email_re.sub("[REDACTED_EMAIL]", text)
-    # redact phones
     redacted = _phone_re.sub("[REDACTED_PHONE]", redacted)
     return redacted
+
 
 def mask_for_logs(text: str, keep=20) -> str:
     if not text:
@@ -52,9 +58,11 @@ def mask_for_logs(text: str, keep=20) -> str:
         return text
     return text[:keep] + "..." + text[-keep:]
 
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
 
 @app.post("/chat")
 async def chat(req: Request):
@@ -65,46 +73,62 @@ async def chat(req: Request):
     if not message:
         raise HTTPException(status_code=400, detail="message is required")
 
-    # Redact PII if enabled
     redacted_message = redact_pii(message) if REDACT_PII else message
 
-    logger.info(f"[CHAT] user={{user_id}} message={{mask_for_logs(message)}} redacted={{mask_for_logs(redacted_message)}}")
+    logger.info(f"[CHAT] user={user_id} message={mask_for_logs(message)} redacted={mask_for_logs(redacted_message)}")
 
-    if not OPENAI_API_KEY:
-        return {"reply": "OpenAI API key not configured. Set OPENAI_API_KEY in environment."}
-
-    system_prompt = (
-        "Vous êtes un assistant RH expert. Répondez de manière concise, professionnelle et conforme au RGPD. "
-        "Si la requête contient des informations personnelles identifiables, appliquez les règles de minimisation des données."
-    )
+    if not client:
+        return {"reply": "ANTHROPIC_API_KEY non configuree. Definissez ANTHROPIC_API_KEY dans l'environnement."}
 
     try:
-        # Using Chat Completions API (sync) for prototype
-        response = openai.ChatCompletion.create(
-            model=OPENAI_MODEL,
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
             messages=[
-                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": redacted_message},
             ],
-            max_tokens=800,
-            temperature=0.2,
         )
-        reply = response["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logger.exception("OpenAI call failed")
-        raise HTTPException(status_code=500, detail=f"OpenAI error: {{str(e)}}")
+        reply = next(
+            (block.text for block in response.content if block.type == "text"),
+            "",
+        )
+    except anthropic.APIError as e:
+        logger.exception("Claude API call failed")
+        raise HTTPException(status_code=500, detail=f"Claude error: {e.message}")
 
-    logger.info(f"[CHAT_REPLY] user={{user_id}} reply={{mask_for_logs(reply)}}")
+    logger.info(f"[CHAT_REPLY] user={user_id} reply={mask_for_logs(reply)}")
 
     return {"reply": reply}
 
+
 @app.websocket("/ws/chat")
 async def websocket_chat(ws: WebSocket):
+    """WebSocket endpoint with streaming responses from Claude."""
     await ws.accept()
+    if not client:
+        await ws.send_text(json.dumps({"type": "error", "text": "ANTHROPIC_API_KEY non configuree."}))
+        await ws.close()
+        return
+
     try:
         while True:
             data = await ws.receive_text()
-            # Basic echo for websocket; production would stream model response
-            await ws.send_text(f"Echo: {{data}}")
+            payload = json.loads(data)
+            message = payload.get("message", data)
+
+            redacted_message = redact_pii(message) if REDACT_PII else message
+
+            # Stream the response token by token
+            with client.messages.stream(
+                model=CLAUDE_MODEL,
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": redacted_message}],
+            ) as stream:
+                for text in stream.text_stream:
+                    await ws.send_text(json.dumps({"type": "delta", "text": text}))
+
+            await ws.send_text(json.dumps({"type": "done"}))
     except Exception:
         await ws.close()
