@@ -3,8 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import re
 import json
+import uuid
 import logging
 import anthropic
+
+from .database import init_db, seed_demo_data, SessionLocal, ChatHistory
+from .tools import TOOLS, execute_tool
 
 # Basic logger
 logger = logging.getLogger("hr-agent")
@@ -18,6 +22,7 @@ logger.addHandler(handler)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
 REDACT_PII = os.getenv("REDACT_PII", "true").lower() in ("1", "true", "yes")
+MAX_TOOL_ROUNDS = 5
 
 if not ANTHROPIC_API_KEY:
     logger.warning("ANTHROPIC_API_KEY is not set. Claude calls will fail until it is configured.")
@@ -35,7 +40,10 @@ app.add_middleware(
 
 SYSTEM_PROMPT = (
     "Vous etes un assistant RH expert. Repondez de maniere concise, professionnelle et conforme au RGPD. "
-    "Si la requete contient des informations personnelles identifiables, appliquez les regles de minimisation des donnees."
+    "Si la requete contient des informations personnelles identifiables, appliquez les regles de minimisation des donnees.\n\n"
+    "Vous avez acces a des outils pour consulter la base de donnees RH : recherche d'employes, "
+    "soldes de conges, politiques internes et liste des equipes. Utilisez ces outils pour repondre "
+    "aux questions avec des donnees reelles."
 )
 
 # Simple PII redaction for prototype
@@ -59,6 +67,103 @@ def mask_for_logs(text: str, keep=20) -> str:
     return text[:keep] + "..." + text[-keep:]
 
 
+# ---------------------------------------------------------------------------
+# Conversation history helpers
+# ---------------------------------------------------------------------------
+
+def load_history(session_id: str) -> list[dict]:
+    """Load conversation history from the database."""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(ChatHistory)
+            .filter(ChatHistory.session_id == session_id)
+            .order_by(ChatHistory.id)
+            .all()
+        )
+        messages = []
+        for row in rows:
+            messages.append({"role": row.role, "content": row.content})
+        return messages
+    finally:
+        db.close()
+
+
+def save_message(session_id: str, role: str, content: str):
+    """Persist a single message to the database."""
+    db = SessionLocal()
+    try:
+        db.add(ChatHistory(session_id=session_id, role=role, content=content))
+        db.commit()
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Agentic loop: call Claude with tools, execute tools, loop until done
+# ---------------------------------------------------------------------------
+
+def run_agent(messages: list[dict]) -> str:
+    """Run the agentic tool loop and return the final text reply."""
+    for _ in range(MAX_TOOL_ROUNDS):
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=2048,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages,
+        )
+
+        # If Claude is done, extract text
+        if response.stop_reason == "end_turn":
+            return next(
+                (block.text for block in response.content if block.type == "text"),
+                "",
+            )
+
+        # Claude wants to use tools
+        tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_use_blocks:
+            return next(
+                (block.text for block in response.content if block.type == "text"),
+                "",
+            )
+
+        # Append assistant response (with tool_use blocks)
+        messages.append({"role": "assistant", "content": response.content})
+
+        # Execute each tool and collect results
+        tool_results = []
+        for tool_block in tool_use_blocks:
+            logger.info(f"[TOOL] Calling {tool_block.name} with {tool_block.input}")
+            result = execute_tool(tool_block.name, tool_block.input)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_block.id,
+                "content": result,
+            })
+
+        messages.append({"role": "user", "content": tool_results})
+
+    # Fallback if we exhausted rounds
+    return "Desole, je n'ai pas pu completer la recherche. Veuillez reformuler votre question."
+
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+    seed_demo_data()
+    logger.info("Database initialized and demo data seeded.")
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -69,37 +174,35 @@ async def chat(req: Request):
     payload = await req.json()
     message = payload.get("message") or payload.get("text") or ""
     user_id = payload.get("user_id", "anonymous")
+    session_id = payload.get("session_id") or str(uuid.uuid4())
 
     if not message:
         raise HTTPException(status_code=400, detail="message is required")
 
     redacted_message = redact_pii(message) if REDACT_PII else message
 
-    logger.info(f"[CHAT] user={user_id} message={mask_for_logs(message)} redacted={mask_for_logs(redacted_message)}")
+    logger.info(f"[CHAT] user={user_id} session={session_id} message={mask_for_logs(message)}")
 
     if not client:
-        return {"reply": "ANTHROPIC_API_KEY non configuree. Definissez ANTHROPIC_API_KEY dans l'environnement."}
+        return {"reply": "ANTHROPIC_API_KEY non configuree.", "session_id": session_id}
+
+    # Load history and append new message
+    messages = load_history(session_id)
+    messages.append({"role": "user", "content": redacted_message})
+    save_message(session_id, "user", redacted_message)
 
     try:
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": redacted_message},
-            ],
-        )
-        reply = next(
-            (block.text for block in response.content if block.type == "text"),
-            "",
-        )
+        reply = run_agent(messages)
     except anthropic.APIError as e:
         logger.exception("Claude API call failed")
         raise HTTPException(status_code=500, detail=f"Claude error: {e.message}")
 
+    # Save assistant reply
+    save_message(session_id, "assistant", reply)
+
     logger.info(f"[CHAT_REPLY] user={user_id} reply={mask_for_logs(reply)}")
 
-    return {"reply": reply}
+    return {"reply": reply, "session_id": session_id}
 
 
 @app.websocket("/ws/chat")
@@ -111,6 +214,9 @@ async def websocket_chat(ws: WebSocket):
         await ws.close()
         return
 
+    session_id = str(uuid.uuid4())
+    await ws.send_text(json.dumps({"type": "session", "session_id": session_id}))
+
     try:
         while True:
             data = await ws.receive_text()
@@ -119,16 +225,65 @@ async def websocket_chat(ws: WebSocket):
 
             redacted_message = redact_pii(message) if REDACT_PII else message
 
-            # Stream the response token by token
+            # Load history for multi-turn
+            messages = load_history(session_id)
+            messages.append({"role": "user", "content": redacted_message})
+            save_message(session_id, "user", redacted_message)
+
+            # For WebSocket we stream the final response but run tools synchronously
+            # First, run tools loop until Claude is ready to give a text response
+            for _ in range(MAX_TOOL_ROUNDS):
+                response = client.messages.create(
+                    model=CLAUDE_MODEL,
+                    max_tokens=2048,
+                    system=SYSTEM_PROMPT,
+                    tools=TOOLS,
+                    messages=messages,
+                )
+
+                if response.stop_reason == "end_turn":
+                    break
+
+                tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+                if not tool_use_blocks:
+                    break
+
+                messages.append({"role": "assistant", "content": response.content})
+
+                tool_results = []
+                for tool_block in tool_use_blocks:
+                    logger.info(f"[WS_TOOL] Calling {tool_block.name}")
+                    result = execute_tool(tool_block.name, tool_block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_block.id,
+                        "content": result,
+                    })
+                    # Notify the client that a tool is being used
+                    await ws.send_text(json.dumps({
+                        "type": "tool",
+                        "name": tool_block.name,
+                        "input": tool_block.input,
+                    }))
+
+                messages.append({"role": "user", "content": tool_results})
+
+            # Now stream the final text response
             with client.messages.stream(
                 model=CLAUDE_MODEL,
-                max_tokens=1024,
+                max_tokens=2048,
                 system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": redacted_message}],
+                tools=TOOLS,
+                messages=messages,
             ) as stream:
+                full_reply = []
                 for text in stream.text_stream:
+                    full_reply.append(text)
                     await ws.send_text(json.dumps({"type": "delta", "text": text}))
 
+            reply_text = "".join(full_reply)
+            save_message(session_id, "assistant", reply_text)
             await ws.send_text(json.dumps({"type": "done"}))
+
     except Exception:
         await ws.close()
